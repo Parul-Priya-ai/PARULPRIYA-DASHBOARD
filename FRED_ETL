@@ -1,0 +1,101 @@
+import os
+import pandas as pd
+from fredapi import Fred
+import psycopg2
+from io import StringIO
+
+# --- Step 1: Extract ---
+print("--- Starting ETL Pipeline ---")
+print("Step 1: Extracting data from FRED...")
+# Read FRED API key from environment (recommended). Fall back to empty string.
+FRED_API_KEY = os.getenv("FRED_API_KEY", "225f85d35b7db1fd23d086be821f0f86")
+fred = Fred(api_key=FRED_API_KEY)
+series_id = 'PAYEMS'
+df = fred.get_series(series_id)
+jobs_df = pd.DataFrame(df, columns=['value']).reset_index().rename(columns={'index': 'date'})
+
+# --- Step 2: Transform ---
+print("Step 2: Transforming data (calculating MoM change)...")
+jobs_df['change_pct'] = (jobs_df['value'].pct_change() * 100).round(2)
+jobs_df['change_abs'] = jobs_df['value'].diff()
+jobs_df.dropna(inplace=True)
+jobs_df = jobs_df.rename(columns={
+    'value': 'total_nonfarm',
+    'change_abs': 'mom_change_abs',
+    'change_pct': 'mom_change_pct'
+})
+
+# --- Step 3: Load ---
+print("Step 3: Loading transformed data into PostgreSQL...")
+# Database details (prefer environment variables)
+DB_NAME = os.getenv('DB_NAME', 'ETL_fred')
+DB_USER = os.getenv('DB_USER', 'postgres')
+DB_PASSWORD = os.getenv('DB_PASSWORD', '1234')
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5432')
+
+def _connect():
+    return psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT)
+
+try:
+    conn = _connect()
+    cursor = conn.cursor()
+
+    # Create target table if it doesn't exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS nonfarm_payrolls (
+            date DATE PRIMARY KEY,
+            total_nonfarm DECIMAL,
+            mom_change_abs DECIMAL,
+            mom_change_pct DECIMAL
+        );
+    """)
+    conn.commit()
+
+    # Create a temporary staging table
+    cursor.execute("""
+        CREATE TEMP TABLE staging_nonfarm_payrolls (
+            date DATE,
+            total_nonfarm DECIMAL,
+            mom_change_abs DECIMAL,
+            mom_change_pct DECIMAL
+        ) ON COMMIT DROP;
+    """)
+    conn.commit()
+
+    # Copy dataframe into staging table using copy_from
+    buffer = StringIO()
+    # include header so we can use pandas to_csv's order explicitly
+    jobs_df.to_csv(buffer, index=False, header=False, sep='\t')
+    buffer.seek(0)
+    cursor.copy_from(buffer, 'staging_nonfarm_payrolls', columns=('date', 'total_nonfarm', 'mom_change_abs', 'mom_change_pct'), sep='\t')
+    conn.commit()
+
+    # Upsert from staging into target table to avoid duplicate primary key errors
+    cursor.execute("""
+        INSERT INTO nonfarm_payrolls (date, total_nonfarm, mom_change_abs, mom_change_pct)
+        SELECT date, total_nonfarm, mom_change_abs, mom_change_pct FROM staging_nonfarm_payrolls
+        ON CONFLICT (date) DO UPDATE
+        SET total_nonfarm = EXCLUDED.total_nonfarm,
+            mom_change_abs = EXCLUDED.mom_change_abs,
+            mom_change_pct = EXCLUDED.mom_change_pct;
+    """)
+    conn.commit()
+
+    print("Data successfully upserted into nonfarm_payrolls!")
+except Exception as e:
+    print(f"An error occurred: {e}")
+finally:
+    try:
+        if cursor:
+            cursor.close()
+    except NameError:
+        pass
+    try:
+        if conn:
+            conn.close()
+            print("Database connection closed.")
+    except NameError:
+        pass
+
+print("--- ETL Pipeline complete! ---")
